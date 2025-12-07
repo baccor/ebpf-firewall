@@ -19,6 +19,15 @@ What it does NOT have:
 
 
 To use it just run the makefile and build the go controller:
-
 cd ebpf && make
 cd ../go && go build -o fw .  
+
+
+Requirements:
+- Linux kernel with BTF
+- Clang with ebpf target support
+- bpftool (for regenerating vmlinux.h if needed)
+- Kernel / libbpf headers providing:
+- bpf/bpf_helpers.h
+- bpf/bpf_endian.h
+- Go
