@@ -19,8 +19,10 @@ What it does NOT have:
 
 
 To use it just run the makefile and build the go controller:
+
 cd ebpf && make
-cd ../go && go build -o fw .  
+
+cd ../go && go build -o fw .
 
 
 Requirements:
@@ -31,3 +33,4 @@ Requirements:
 - bpf/bpf_helpers.h
 - bpf/bpf_endian.h
 - Go
+- Sudo
