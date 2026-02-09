@@ -21,6 +21,7 @@ What it does NOT have:
 To use it just run the makefile and build the go controller:
 
 cd ebpf && make
+ 
 cd ../go && go build -o fw .
 
 
