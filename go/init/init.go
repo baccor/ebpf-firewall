@@ -453,7 +453,7 @@ func Rule(args []string, mps *Maps) {
 	}
 
 	prtcl := uint8(6)
-	if len(os.Args) == 5 {
+	if len(os.Args) == 7 {
 		if os.Args[6] == "udp" {
 			prtcl = uint8(17)
 		}

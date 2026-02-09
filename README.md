@@ -21,7 +21,6 @@ What it does NOT have:
 To use it just run the makefile and build the go controller:
 
 cd ebpf && make
-
 cd ../go && go build -o fw .
 
 
@@ -34,3 +33,6 @@ Requirements:
 - bpf/bpf_endian.h
 - Go
 - Sudo
+
+
+I'm currently redoing this with wildcard support, logging, daemon with rule state reconciliation and some more so it's yet to be updated.

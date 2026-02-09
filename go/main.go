@@ -58,7 +58,7 @@ func main() {
 		if len(os.Args) != 5 {
 			log.Fatalf("usage: fw attach <ebpf.o> <interface> ingress|egress")
 		}
-		if initfrwl.Attach(os.Args[2], os.Args[3], os.Args[4]); err != nil {
+		if err := initfrwl.Attach(os.Args[2], os.Args[3], os.Args[4]); err != nil {
 			log.Fatalf("error attaching frwll: %v", err)
 		}
 
