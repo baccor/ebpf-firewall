@@ -1,44 +1,40 @@
 package initfrwl
 
 import (
-	"encoding/binary"
+	"bufio"
 	"errors"
 	"fmt"
+	"frwl/dae"
 	"io/fs"
 	"log"
 	"net"
 	"os"
-	"strconv"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
-const ips = "/sys/fs/bpf/fw_ips"
-const ipss = "/sys/fs/bpf/fw_ipss"
-const ipsd = "/sys/fs/bpf/fw_ipsd"
+const srcpth = "/sys/fs/bpf/fw_src"
+const rlespth = "/sys/fs/bpf/fw_rles"
+const dstpth = "/sys/fs/bpf/fw_dst"
+const skt = "/var/tmp/frwll/frwlld.sock"
 
-type keyc struct {
-	Src   uint32
-	Dst   uint32
-	Sprt  uint16
-	Dprt  uint16
-	Prtcl uint8
-	Pad   [3]byte
-}
-
-type kssd struct {
-	IP    uint32
-	Prt   uint16
-	Prtcl uint8
-	Pad   uint8
+type key struct {
+	id    uint64
+	sprt  uint16
+	dprt  uint16
+	prtcl uint8
+	wc    uint8
 }
 
 type Maps struct {
-	Ips  *ebpf.Map
-	Ipss *ebpf.Map
-	Ipsd *ebpf.Map
+	src    *ebpf.Map
+	dst    *ebpf.Map
+	rles   *ebpf.Map
+	islogs *ebpf.Map
+	logs   *ebpf.Map
 }
 
 func Init(pth, intf, igeg string) error {
@@ -55,9 +51,11 @@ func Init(pth, intf, igeg string) error {
 
 		col, err = ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
 			MapReplacements: map[string]*ebpf.Map{
-				"ips":  mps.Ips,
-				"ipss": mps.Ipss,
-				"ipsd": mps.Ipsd,
+				"fw_rles":   mps.rles,
+				"fw_src":    mps.src,
+				"fw_dst":    mps.dst,
+				"fw_islogs": mps.islogs,
+				"fw_logs":   mps.logs,
 			},
 		})
 		if err != nil {
@@ -66,7 +64,7 @@ func Init(pth, intf, igeg string) error {
 		log.Println("reusing existing pinned maps /sys/fs/bpf/fw_*")
 	} else {
 		if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("error checking pinned map %s: %w", ips, err)
+			return fmt.Errorf("error checking pinned map %s: %w", rlespth, err)
 		}
 
 		col, err = ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
@@ -78,30 +76,12 @@ func Init(pth, intf, igeg string) error {
 			return fmt.Errorf("error creating collection: %v", err)
 		}
 
-		pinMap := func(name, path string) error {
-			m, ok := col.Maps[name]
-			if !ok {
-				return fmt.Errorf("error: map %q not found in %s", name, pth)
-			}
-			if err := m.Pin(path); err != nil {
-				if !os.IsExist(err) {
-					return fmt.Errorf("error pinning %s -> %s: %w", name, path, err)
-				}
-			}
-			return nil
-		}
-
-		if err := pinMap("ips", ips); err != nil {
-			return err
-		}
-		if err := pinMap("ipss", ipss); err != nil {
-			return err
-		}
-		if err := pinMap("ipsd", ipsd); err != nil {
-			return err
+		if err := dae.Globalfb(); err != nil {
+			return fmt.Errorf("error adding global fallbacks: %v", err)
 		}
 
 		log.Println("maps pinned under /sys/fs/bpf/fw_*")
+
 	}
 
 	defer col.Close()
@@ -110,6 +90,12 @@ func Init(pth, intf, igeg string) error {
 		log.Println("initialized firewall maps only (no attach)")
 		return nil
 	}
+
+	if err := dae.Rundae(); err != nil {
+		return fmt.Errorf("error running daemon.")
+	}
+
+	log.Println("daemon running.")
 
 	nlLink, err := netlink.LinkByName(intf)
 	if err != nil {
@@ -182,17 +168,19 @@ func Attach(pth, intf, igeg string) error {
 	mps, err := Omaps()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("attach: pinned map %s does not exist (run init/prepare first)", ips)
+			return fmt.Errorf("attach: pinned map %s does not exist (run init/prepare first)", rlespth)
 		}
-		return fmt.Errorf("attach: error opening %s: %w", ips, err)
+		return fmt.Errorf("attach: error opening %s: %w", rlespth, err)
 	}
 	defer mps.Close()
 
 	col, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
 		MapReplacements: map[string]*ebpf.Map{
-			"ips":  mps.Ips,
-			"ipss": mps.Ipss,
-			"ipsd": mps.Ipsd,
+			"fw_rles":   mps.rles,
+			"fw_src":    mps.src,
+			"fw_dst":    mps.dst,
+			"fw_islogs": mps.islogs,
+			"fw_logs":   mps.logs,
 		},
 	})
 	if err != nil {
@@ -287,8 +275,8 @@ func Rem(intf, igeg string) error {
 	return nil
 }
 
-func Clr() error {
-	paths := []string{ips, ipss, ipsd}
+func Clrall() error { //for later
+	paths := []string{rlespth, srcpth, dstpth}
 
 	for _, p := range paths {
 		m, err := ebpf.LoadPinnedMap(p, nil)
@@ -297,9 +285,9 @@ func Clr() error {
 		}
 
 		switch p {
-		case ips:
+		case rlespth:
 			it := m.Iterate()
-			var k keyc
+			var k key
 			var v uint32
 			for it.Next(&k, &v) {
 				if err := m.Delete(&k); err != nil {
@@ -312,9 +300,9 @@ func Clr() error {
 				return fmt.Errorf("error iterating %s: %w", p, err)
 			}
 
-		case ipss, ipsd:
+		case srcpth, dstpth:
 			it := m.Iterate()
-			var k kssd
+			var k key
 			var v uint32
 			for it.Next(&k, &v) {
 				if err := m.Delete(&k); err != nil {
@@ -334,7 +322,7 @@ func Clr() error {
 	return nil
 }
 
-func Ip(s string) uint32 {
+/*func Ip(s string) uint32 {
 	ip := net.ParseIP(s).To4()
 	if ip == nil {
 		log.Fatalf("not an ipv4: %s", s)
@@ -380,133 +368,263 @@ func Prt(s string) uint16 {
 	}
 	prt := uint16(p)
 	return (prt >> 8) | (prt << 8)
-}
+} */
 
 func Omaps() (*Maps, error) {
-	ips, err := ebpf.LoadPinnedMap("/sys/fs/bpf/fw_ips", nil)
+	ips, err := ebpf.LoadPinnedMap("/sys/fs/bpf/fw_rles", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	ipss, err := ebpf.LoadPinnedMap("/sys/fs/bpf/fw_ipss", nil)
+	ipss, err := ebpf.LoadPinnedMap("/sys/fs/bpf/fw_src", nil)
 	if err != nil {
 		ips.Close()
 		return nil, err
 	}
 
-	ipsd, err := ebpf.LoadPinnedMap("/sys/fs/bpf/fw_ipsd", nil)
+	ipsd, err := ebpf.LoadPinnedMap("/sys/fs/bpf/fw_dst", nil)
 	if err != nil {
 		ips.Close()
 		ipss.Close()
 		return nil, err
 	}
 
-	return &Maps{Ips: ips, Ipss: ipss, Ipsd: ipsd}, nil
+	ilgs, err := ebpf.LoadPinnedMap("/sys/fs/bpf/fw_islogs", nil)
+	if err != nil {
+		ips.Close()
+		ipss.Close()
+		return nil, err
+	}
+
+	lgs, err := ebpf.LoadPinnedMap("/sys/fs/bpf/fw_logs", nil)
+	if err != nil {
+		ips.Close()
+		ipss.Close()
+		return nil, err
+	}
+
+	return &Maps{rles: ips, src: ipss, dst: ipsd, islogs: ilgs, logs: lgs}, nil
 }
 
 func (mps *Maps) Close() {
-	mps.Ips.Close()
-	mps.Ipss.Close()
-	mps.Ipsd.Close()
+	mps.rles.Close()
+	mps.src.Close()
+	mps.dst.Close()
 }
-func Dst(args []string, mps *Maps) {
-	if len(os.Args) != 4 && len(os.Args) != 5 {
-		log.Fatalf("usage: fw dst <ip> <port> [tcp/udp]")
+func Dst(args []string) error {
+	if len(os.Args) != 4 {
+		return fmt.Errorf("usage: fw dst ip{/cidr}:port [TCP/UDP]")
 	}
-	d := uint32(1)
+	conn, err := net.Dial("unix", skt)
+	if err != nil {
+		return fmt.Errorf("dial daemon: %w", err)
+	}
+	defer conn.Close()
 
-	prt := Prt(os.Args[3])
-	ips := Ips(os.Args[2])
-	if ips == nil {
-		log.Fatalf("no IPv4 addresses resolved for %q", os.Args[2])
+	if _, err := fmt.Fprintln(conn, "dst", os.Args[2], os.Args[3]); err != nil {
+		return fmt.Errorf("error: %w", err)
 	}
 
-	prtcl := uint8(6)
-	if len(os.Args) == 5 {
-		if os.Args[4] == "udp" {
-			prtcl = uint8(17)
+	r := bufio.NewReader(conn)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("error reading response: %w", err)
+	}
+
+	line = strings.TrimSpace(line)
+	parts := strings.SplitN(line, " ", 2)
+
+	if len(parts) == 0 {
+		return fmt.Errorf("error: no response from daemon")
+	}
+
+	switch parts[0] {
+	case "added":
+		return nil
+	case "error":
+		if len(parts) >= 2 {
+			return fmt.Errorf("daemon error: %s", parts[1:])
 		}
+		return fmt.Errorf("daemon error")
+	default:
+		return fmt.Errorf("error, unexpected response: %q", line)
 	}
-
-	for _, ip := range ips {
-		k := kssd{
-			IP:    ip,
-			Prt:   prt,
-			Prtcl: prtcl,
-			Pad:   0,
-		}
-		if err := mps.Ipsd.Put(k, d); err != nil {
-			log.Fatalf("error putting dst rule for %v: %v", ip, err)
-		}
-	}
-	log.Println("dst rule applied")
-}
-
-func Rule(args []string, mps *Maps) {
-	if len(os.Args) != 6 && len(os.Args) != 7 {
-		log.Fatalf("usage: fw rule <src_ip> <src_port> <dst_ip> <dst_port> [tcp/udp]")
-	}
-	d := uint32(1)
-
-	if net.ParseIP(os.Args[2]) == nil || net.ParseIP(os.Args[4]) == nil {
-		log.Fatalf("invalid IP(s)")
-	}
-
-	prtcl := uint8(6)
-	if len(os.Args) == 7 {
-		if os.Args[6] == "udp" {
-			prtcl = uint8(17)
-		}
-	}
-
-	src := Ip(os.Args[2])
-	sprt := Prt(os.Args[3])
-	dst := Ip(os.Args[4])
-	dprt := Prt(os.Args[5])
-
-	key := keyc{
-		Src:   src,
-		Dst:   dst,
-		Sprt:  sprt,
-		Dprt:  dprt,
-		Prtcl: prtcl,
-		Pad:   [3]byte{},
-	}
-
-	if err := mps.Ips.Put(key, d); err != nil {
-		log.Fatalf("error putting rule: %v", err)
-	}
-	log.Println("rule applied")
 }
 
-func Src(args []string, mps *Maps) {
-	if len(os.Args) != 4 && len(os.Args) != 5 {
-		log.Fatalf("usage: fw src <ip> <port> [tcp/udp]")
+func Rule(args []string) error {
+	if len(os.Args) != 5 {
+		return fmt.Errorf("usage: fw rule src_ip/cidr:port dst_ip/cidr:port [TCP/UDP]")
 	}
-	d := uint32(1)
-	prt := Prt(os.Args[3])
-	ips := Ips(os.Args[2])
-	if ips == nil {
-		log.Fatalf("no IPv4 addresses resolved for %q", os.Args[2])
+	conn, err := net.Dial("unix", skt)
+	if err != nil {
+		return fmt.Errorf("dial daemon: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := fmt.Fprintln(conn, "rule", os.Args[2], os.Args[3], os.Args[4]); err != nil {
+		return fmt.Errorf("error: %w", err)
 	}
 
-	prtcl := uint8(6)
-	if len(os.Args) == 5 {
-		if os.Args[4] == "udp" {
-			prtcl = uint8(17)
-		}
+	r := bufio.NewReader(conn)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("error reading response: %w", err)
 	}
 
-	for _, ip := range ips {
-		k := kssd{
-			IP:    ip,
-			Prt:   prt,
-			Prtcl: prtcl,
-			Pad:   0,
-		}
-		if err := mps.Ipss.Put(k, d); err != nil {
-			log.Fatalf("error putting src rule for %v: %v", ip, err)
-		}
+	line = strings.TrimSpace(line)
+	parts := strings.SplitN(line, " ", 2)
+
+	if len(parts) == 0 {
+		return fmt.Errorf("error: no response from daemon")
 	}
-	log.Println("src rule applied")
+
+	switch parts[0] {
+	case "added":
+		return nil
+	case "error":
+		if len(parts) >= 2 {
+			return fmt.Errorf("daemon error: %s", parts[1:])
+		}
+		return fmt.Errorf("daemon error")
+	default:
+		return fmt.Errorf("error, unexpected response: %q", line)
+	}
+}
+
+func Src(args []string) error {
+	if len(os.Args) != 4 {
+		return fmt.Errorf("usage: fw src_ip{/cidr}:port [tcp/udp]")
+	}
+	conn, err := net.Dial("unix", skt)
+	if err != nil {
+		return fmt.Errorf("dial daemon: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := fmt.Fprintln(conn, "src", os.Args[2], os.Args[3]); err != nil {
+		return fmt.Errorf("error: %w", err)
+	}
+
+	r := bufio.NewReader(conn)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("error reading response: %w", err)
+	}
+
+	line = strings.TrimSpace(line)
+	parts := strings.SplitN(line, " ", 2)
+
+	if len(parts) == 0 {
+		return fmt.Errorf("error: no response from daemon")
+	}
+
+	switch parts[0] {
+	case "added":
+		return nil
+	case "error":
+		if len(parts) >= 2 {
+			return fmt.Errorf("daemon error: %s", parts[1:])
+		}
+		return fmt.Errorf("daemon error")
+	default:
+		return fmt.Errorf("error, unexpected response: %q", line)
+	}
+}
+
+func Clr(args []string) error {
+	if len(os.Args) != 5 && len(os.Args) != 6 {
+		return fmt.Errorf("usage: fw clear src... || dst... || rule... ")
+	}
+	conn, err := net.Dial("unix", skt)
+	if err != nil {
+		return fmt.Errorf("dial daemon: %w", err)
+	}
+	defer conn.Close()
+
+	switch os.Args[2] {
+
+	case "src":
+		if _, err := fmt.Fprintln(conn, "clear", "src", os.Args[3], os.Args[4]); err != nil {
+			return fmt.Errorf("error: %w", err)
+		}
+
+	case "dst":
+		if _, err := fmt.Fprintln(conn, "clear", "dst", os.Args[3], os.Args[4]); err != nil {
+			return fmt.Errorf("error: %w", err)
+		}
+
+	case "rule":
+		if _, err := fmt.Fprintln(conn, "clear", "rule", os.Args[3], os.Args[4], os.Args[5]); err != nil {
+			return fmt.Errorf("error: %w", err)
+		}
+
+	default:
+		return fmt.Errorf("unknown command.")
+
+	}
+
+	r := bufio.NewReader(conn)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("error reading response: %w", err)
+	}
+
+	line = strings.TrimSpace(line)
+	parts := strings.SplitN(line, " ", 2)
+
+	if len(parts) == 0 {
+		return fmt.Errorf("error: no response from daemon")
+	}
+
+	switch parts[0] {
+	case "cleared":
+		return nil
+	case "error":
+		if len(parts) >= 2 {
+			return fmt.Errorf("daemon error: %s", parts[1:])
+		}
+		return fmt.Errorf("daemon error")
+	default:
+		return fmt.Errorf("error, unexpected response: %q", line)
+	}
+}
+
+func Log(args []string) error {
+	if len(os.Args) != 3 {
+		return fmt.Errorf("usage: fw log on||off||export||stop")
+	}
+	conn, err := net.Dial("unix", skt)
+	if err != nil {
+		return fmt.Errorf("dial daemon: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := fmt.Fprintln(conn, "log", os.Args[2]); err != nil {
+		return fmt.Errorf("error: %w", err)
+	}
+
+	r := bufio.NewReader(conn)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("error reading response: %w", err)
+	}
+
+	line = strings.TrimSpace(line)
+	parts := strings.SplitN(line, " ", 2)
+
+	if len(parts) == 0 {
+		return fmt.Errorf("error: no response from daemon")
+	}
+
+	switch parts[0] {
+	case "done":
+		return nil
+	case "error":
+		if len(parts) >= 2 {
+			return fmt.Errorf("daemon error: %s", parts[1:])
+		}
+		return fmt.Errorf("daemon error")
+	default:
+		return fmt.Errorf("error, unexpected response: %q", line)
+	}
 }
